@@ -1,0 +1,428 @@
+---
+title: "Infraestructura Vial LA"
+author: "Alex"
+date: "2023-02-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import packages
+```{r}
+library(pwt10)
+library(readxl)
+library(tidyr)
+library(plm)
+library(splm)
+library(dplyr)
+library(stringi)
+library(sf)
+library(spdep)
+library(igraph)
+require("rgdal")
+```
+
+
+```{r}
+# establish wd
+setwd("../transportation_latam/")
+
+INFRALATAM <- read_excel("other_opport/INFRALATAM.xlsx", sheet = "Data")
+INFRALATAM <- (INFRALATAM[1:3821,1:8])
+colnames(INFRALATAM)[1:2] <- c("country","year")
+INFRALATAM$country <- as.vector(apply(matrix(INFRALATAM$country), 2, function(x) stri_trans_general(x, "Latin-ASCII")))
+INFRALATAM$country <- as.factor(INFRALATAM$country)
+
+# use pwt dataset
+# it provides information on relative levels of income, output, input, and productivity for 183 countries between 1950 and 2019.
+pwt10.0$country <- as.factor(pwt10.0$country)
+pwt10.0$country <- trimws(gsub("\\(.*\\)", "", pwt10.0$country))
+
+# estimate growth rate of rgdpna
+pwt10.01 <- pwt10.0 %>%
+  group_by(country) %>% 
+  select(year, country, rgdpna, pop, emp, hc, rnna, rkna, delta) %>% 
+  mutate(growth = ((rgdpna -  dplyr::lag(rgdpna,1))/dplyr::lag(rgdpna))) %>%
+  drop_na(growth)   
+
+pwt10.01.previousyears <- pwt10.0 %>%
+  filter(!(year %in% 2008:2019)) %>% 
+  group_by(country) %>%
+    select(year, country, rgdpna) %>% 
+    mutate(growth = ((rgdpna -  dplyr::lag(rgdpna,1))/dplyr::lag(rgdpna))) %>%
+    drop_na(growth) %>% 
+    mutate(mean_growth = mean(growth)) %>% 
+  select(country, mean_growth) %>% 
+  distinct()
+
+# mean growth of the all years previpus 2008
+# pwt10.01 <- pwt10.01 %>% mutate(mean_growth = mean(growth))
+pwt10.01 <- merge(x = pwt10.01, 
+           y = pwt10.01.previousyears, by = c("country"))
+
+# copy of INFRALATAM using klems sheet
+INFRALATAM1 <- read_excel("other_opport/INFRALATAM.xlsx", 
+    sheet = "klems")
+colnames(INFRALATAM1) <- as.vector(apply(matrix(colnames(INFRALATAM1)), 2, function(x) stri_trans_general(x, "Latin-ASCII")))
+
+# change data type
+desired_types <- list()
+for (i in colnames(INFRALATAM1)[-ncol(INFRALATAM1)] ) desired_types[[i]] <- "numeric"
+desired_types[['Sector']] <- "character"
+
+INFRALATAM1 <- INFRALATAM1 %>%
+  mutate(across(
+    all_of(names(desired_types)),
+    ~ switch(desired_types[[cur_column()]],
+              numeric = as.numeric(.),
+              character = as.character(.))
+  ))
+
+# pivot table with GDP share
+names <- colnames(INFRALATAM1)[2:(ncol(INFRALATAM1)-1)]
+INFRALATAM2 <- INFRALATAM1 %>% 
+  pivot_longer(cols = contains(names), names_to = "country", values_to = "GDP_share") %>% 
+  mutate(GDP_share = GDP_share/100) %>% 
+  pivot_wider(names_from = Sector, values_from = GDP_share)
+
+```
+
+
+```{r}
+# select 3 sectors and transform as factor vector, also change subsector as facyor
+INFRALATAM$Sector <- as.factor(INFRALATAM$Sector)
+names <- levels(INFRALATAM$Sector)
+sectors <- c("Telecomunications", "Transport", "Energy")
+INFRALATAM$Subsector <- as.factor(INFRALATAM$Subsector)
+
+# merge dataframes between INFRALATAM and pwt10.01
+Infrastructure1 <- merge(x = INFRALATAM, y = pwt10.01, by = c("year", "country")) %>% 
+  dplyr::group_by(country)
+
+```
+
+
+```{r}
+# remenber INFRALATAM2 is a pivot ds with gdp_share of latinamerica countries
+# pwt10.01 is a ds pwt10.0 with growth rate of rgdpna and mean_growth
+klems <- merge(INFRALATAM2, y = pwt10.01, by = c("year", "country")) %>% 
+  dplyr::group_by(country) %>% 
+  arrange(country, year)
+
+# estimate the percentage of energy, transport and telc based on GDP
+klems1 <- klems %>% 
+  mutate(Energy = Energía*rgdpna, 
+         TELC = Telecomunicaciones*rgdpna, 
+         Transport = Transporte*rgdpna) %>% 
+  arrange(country, year)
+
+# estimate initial values (2008) for K_energy, K_TELC, K_transport, Kapital when they have an observation on 2008,
+# otherwise, you are gonna start at the first non-NA values (2009, 2010,... etc)
+
+klems2 <- klems1  %>%
+  group_by(country) %>%
+  mutate(
+    K_energy_orig = Energy * (1 / ( ( ifelse(is.na(delta), 0.025, delta ) ) + first(mean_growth)) ) ,
+    K_TELC_orig = TELC * (1 / ( ( ifelse(is.na(delta), 0.025, delta ) ) + first(mean_growth))) ,
+    K_transport_orig = Transport * (1 / ( ( ifelse(is.na(delta), 0.025, delta ) ) + first(mean_growth)) ) ,
+    Kapital_orig = rnna * (1 / ( ( ifelse(is.na(delta), 0.025, delta ) ) + first(mean_growth)) ),
+    Kapital_rkna_orig = rkna * (1 / ( ( ifelse(is.na(delta), 0.025, delta ) ) + first(mean_growth)) )
+  ) %>% 
+  mutate(
+    K_energy_orig = ifelse(row_number() == which(!is.na(Energy))[1], K_energy_orig, NA),
+    K_TELC_orig = ifelse(row_number() == which(!is.na(TELC))[1], K_TELC_orig, NA),
+    K_transport_orig = ifelse(row_number() == which(!is.na(Transport))[1], K_transport_orig, NA),
+    Kapital_orig = ifelse(row_number() == which(!is.na(rnna))[1], Kapital_orig, NA),
+    Kapital_rkna_orig = ifelse(row_number() == which(!is.na(rkna))[1], Kapital_rkna_orig, NA)
+  ) %>% 
+  arrange(country, year)
+
+# order by country and create tiempo variable
+klems3 <- klems2 %>% arrange(country) %>% mutate(Tiempo = 0:11)
+
+```
+
+```{r}
+# ****************************************************************************************
+klems3$K_transport <- klems3$K_transport_orig
+# Calculate capital stock for each year for each country
+for (country in unique(klems3$country)) {
+  for (i in which(klems3$country == country)[1:length(which(klems3$country == country))]) {
+    id_time <- klems3$Tiempo[i]
+    if (id_time == 0){
+      k_previous <- klems3$K_transport[i]
+    } else{ 
+      k_previous <- klems3$K_transport[i - 1]
+      }
+    k_current <- klems3$Transport[i]
+
+    if (is.na(k_previous)){
+      k_previous <- 0
+    }
+    if (is.na(k_current)){
+      k_current <- 0
+    }
+    klems3$K_transport[i] <- (k_current + (k_previous*(1 - 0.025)) )
+  }
+}
+
+# correct by values of 0
+klems3$K_transport[(klems3$K_transport == 0) & (!is.na(klems3$K_transport))] <- NA
+
+# ****************************************************************************************
+klems3$K_TELC <- klems3$K_TELC_orig
+# Calculate capital stock for each year for each country
+for (country in unique(klems3$country)) {
+  for (i in which(klems3$country == country)[1:length(which(klems3$country == country))]) {
+    id_time <- klems3$Tiempo[i]
+    if (id_time == 0){
+      k_previous <- klems3$K_TELC[i]
+    } else{ 
+      k_previous <- klems3$K_TELC[i - 1]
+      }
+    k_current <- klems3$TELC[i]
+
+    if (is.na(k_previous)){
+      k_previous <- 0
+    }
+    if (is.na(k_current)){
+      k_current <- 0
+    }
+    klems3$K_TELC[i] <- (k_current + (k_previous*(1 - 0.025)) )
+  }
+}
+
+# correct by values of 0
+klems3$K_TELC[(klems3$K_TELC == 0) & (!is.na(klems3$K_TELC))] <- NA
+# set original zero value
+klems3$K_TELC[which(klems3$K_TELC_orig == 0)] <- 0
+
+# ****************************************************************************************
+klems3$Kapital <- klems3$Kapital_orig
+# Calculate capital stock for each year for each country
+for (country in unique(klems3$country)) {
+  for (i in which(klems3$country == country)[1:length(which(klems3$country == country))]) {
+    
+    id_time <- klems3$Tiempo[i]
+    if (id_time == 0){
+      k_previous <- klems3$Kapital[i]
+    } else{ 
+      k_previous <- klems3$Kapital[i - 1]
+      }
+    k_current <- klems3$rnna[i]
+
+    if (is.na(k_previous)){
+      k_previous <- 0
+    }
+    if (is.na(k_current)){
+      k_current <- 0
+    }
+    klems3$Kapital[i] <- (k_current + (k_previous*(1 - 0.025)) )
+  }
+}
+# correct by zeros
+klems3$Kapital[(klems3$Kapital == 0)] <- NA
+
+# Corrected by subtraction
+klems3$Kapital_minus_ktelc_ktransport <- klems3$rnna - (replace(klems3$K_TELC, is.na(klems3$K_TELC), 0)) - (replace(klems3$K_transport, is.na(klems3$K_transport), 0)) 
+
+klems3$Kapital_minus_ktelc <- klems3$rnna - (replace(klems3$K_TELC, is.na(klems3$K_TELC), 0))
+klems3$Kapital_minus_ktransp <- klems3$rnna - (replace(klems3$K_transport, is.na(klems3$K_transport), 0))
+
+```
+
+
+```{r}
+# remove Guyana , it has a lot missing values
+klems3 <- klems3 %>% mutate(TPW = K_transport/emp, 
+                            TPN = K_transport/pop, 
+                            GDPN = (rgdpna- (replace(Transport, is.na(Transport), 0)) ) /pop, 
+                            GDPW = (rgdpna- (replace(Transport, is.na(Transport), 0))  )/emp,
+                            KW = Kapital/emp,
+                            KN = Kapital / pop,
+                            KwoTELCwoTRANSPW = Kapital_minus_ktelc_ktransport/emp,
+                            KwoTELCwoTRANSPN = Kapital_minus_ktelc_ktransport/pop,
+                            KwoTELCW = Kapital_minus_ktelc/emp,
+                            KwoTELCN = Kapital_minus_ktelc/pop,
+                            KwoTRANSPW = Kapital_minus_ktransp/emp,
+                            KwoTRANSPN = Kapital_minus_ktransp/pop,
+                            
+                            ) %>% 
+  filter(country != "Guyana")
+
+# fill missing valued using "up" option
+klems3 <- klems3 %>%
+  group_by(country) %>%
+  fill(TPW, TPN, GDPN, GDPW, KW, KN, KwoTELCwoTRANSPW, KwoTELCwoTRANSN,
+       KwoTELCW, KwoTELCN, KwoTRANSPW, KwoTRANSPN, .direction = "up") %>%
+  ungroup()
+
+```
+
+## matrix construction
+```{r}
+
+latin.america.countries <- c( "Mexico", "Guatemala", "El Salvador", "Nicaragua", "Costa Rica", "Honduras", "Panama",
+                              "Colombia", "Ecuador", "Guyana", "Suriname", "Peru", 
+                              "Brazil", "Bolivia", "Paraguay", "Chile", "Argentina", "Uruguay", "Trinidad and Tobago",
+                              "Dominican Republic", "Haiti")
+
+# number of countries to use in the model
+latin.america.countries <- latin.america.countries[(latin.america.countries %in% klems3$country)]
+cat(" based on the klems3 dataset, we are gonna use:", length(latin.america.countries), 'countries')
+
+# geo data
+shapefile_latam <-  st_read("TM_WORLD_BORDERS_SIMPL-0.3/TM_WORLD_BORDERS_SIMPL-0.3.shp")
+krs_shp_mtrx_world <- readOGR("TM_WORLD_BORDERS_SIMPL-0.3/", "TM_WORLD_BORDERS_SIMPL-0.3")
+krs_shp_mtrx_latam <- krs_shp_mtrx_world  %>% subset(., NAME %in% latin.america.countries )
+
+full.ds <- (merge(klems3, krs_shp_mtrx_latam@data, by.x = "country", by.y = "NAME"))
+full.ds <- full.ds %>% arrange(country,year)
+# full.ds[is.na(full.ds)] <- 0.001
+
+# estimation
+# distance matrix using: inverse distance approach
+alpha.inverse = 1
+distmat.latam <- as.matrix(dist(coordinates(krs_shp_mtrx_latam), method = "euclidean"))
+distmat.latam.inv <- 1/(distmat.latam^(alpha.inverse))
+diag(distmat.latam.inv) <- 0
+
+# weighted matrix using distance approach
+distmat.latam.inv.weighted <- mat2listw(distmat.latam.inv, style = "W", row.names = krs_shp_mtrx_latam@data$NAME)
+summary(distmat.latam.inv.weighted)
+
+# plot using distance approach
+plot(krs_shp_mtrx_latam, border="grey60")
+plot(distmat.latam.inv.weighted, coordinates(krs_shp_mtrx_latam), add=TRUE, col="red")
+
+# distance matrix using: K-neighbors approach
+k.value <- 3
+coords.latam <- coordinates(krs_shp_mtrx_latam) 
+k.neighborhood <- (knearneigh(coords.latam, k = k.value, longlat = TRUE))
+k.neighborhood.list <- knn2nb(k.neighborhood)
+ids.knn <- k.neighborhood$nn
+ids.knn.fixed <- matrix(colnames(distmat.latam.inv)[ids.knn], ncol = ncol(ids.knn), nrow = nrow(ids.knn) )
+rownames(ids.knn.fixed) <- colnames(distmat.latam.inv)
+
+# Define a function to replace values with zero
+replace_with_zero <- function(row_idx, col_idx, mat) {
+  mat[row_idx, col_idx] <- 0
+  mat
+}
+
+# Initialize a new matrix
+new_matrix.dist.knn <- distmat.latam.inv
+
+# Iterate through ids.k2n.fixed and update new_matrix
+for (i in rownames(ids.knn.fixed) ) {
+  col_idx <- rownames(ids.knn.fixed)[!(rownames(ids.knn.fixed) %in% ids.knn.fixed[i,])]
+  new_matrix.dist.knn <- replace_with_zero(i, col_idx, new_matrix.dist.knn)
+}
+
+# weighted matrix using knn approach
+distmat.latam.inv.weighted.knn <- mat2listw(new_matrix.dist.knn, style = "W", row.names = krs_shp_mtrx_latam@data$NAME)
+summary(distmat.latam.inv.weighted.knn)
+
+# plot using distance approach
+plot(krs_shp_mtrx_latam, border="grey60")
+plot(distmat.latam.inv.weighted.knn, coordinates(krs_shp_mtrx_latam), add=TRUE, col="green")
+
+```
+
+## estimation of centrality metrics
+```{r}
+ids.knn.w.labels <- matrix((krs_shp_mtrx_latam@data$NAME)[ids.knn], ncol = ncol(ids.knn), nrow = nrow(ids.knn) )
+rownames(ids.knn.w.labels) <- (krs_shp_mtrx_latam@data$NAME)
+output_df <- as.data.frame(ids.knn.w.labels)
+
+# create edges
+pairs_df <- data.frame(
+  Country1 = rep( (krs_shp_mtrx_latam@data$NAME) , each = ncol(output_df)),
+  Country2 = as.vector(t(ids.knn.w.labels))
+)
+
+# create network and igraph object 
+network_Matrix <- as.matrix(pairs_df)
+graph.latam <- graph_from_edgelist(network_Matrix, directed=FALSE)
+graph.latam <- simplify(graph.latam)
+
+# estimate centrality metrics
+eigen.latam <- evcent(graph.latam)$vector
+closeness.latam <- closeness(graph.latam)
+betweenness.latam <- betweenness(graph.latam)
+
+ds.centrality.metrics <- as.data.frame( cbind(eigen.latam,closeness.latam, betweenness.latam ) )
+ds.centrality.metrics$country <- rownames(ds.centrality.metrics)
+rownames(ds.centrality.metrics) <- NULL
+
+# merge datasets
+full.ds <- merge(x = full.ds, y= ds.centrality.metrics, by = c("country"))
+
+# plot
+# lay <- layout_with_kk(graph.latam)
+lay <- layout.fruchterman.reingold(graph.latam)
+
+plot(graph.latam, layout = lay,
+     vertex.size = betweenness(graph.latam) *1/4
+     )
+plot(graph.latam, layout = lay,
+     vertex.size = evcent(graph.latam)$vector *10
+     )
+
+```
+
+## model estimation
+```{r}
+# lm model using centrality metric and year 2019
+formula_vial_lm19 <- log(GDPN) ~ log(TPN) + log(KN) + eigen.latam
+f_vial_lm19 <- lm(formula_vial_lm19,
+                  data = full.ds %>% filter(year == 2019))
+summary(f_vial_lm19)
+
+# data panel model using log transf. (W)
+formula_vial_n <- log(GDPN) ~ log(TPN) + log(KN)
+f_vial_n <- spml(formula_vial_n, data = full.ds,
+               index = c("country","year"),
+               listw = distmat.latam.inv.weighted.knn,
+               model="within", spatial.error="none",
+               effect = "twoways", method = "eigen",
+               lag=TRUE)
+
+summary(f_vial_n)
+
+# data panel model using log transf. (N)
+formula_vial_w <- log(GDPW) ~ log(TPW) + log(KW)
+f_vial_w <- spml(formula_vial_w, data = full.ds,
+               index = c("country","year"),
+               listw = distmat.latam.inv.weighted.knn,
+               model="within", spatial.error="none",
+               effect = "twoways", method = "eigen",
+               lag=TRUE)
+
+summary(f_vial_w)
+
+# data panel model using log transf. , kapital without telc and transp (W)
+formula_vial_kwoTELCwoTRANSPw <- log(GDPW) ~ log(TPW) + log(KwoTELCwoTRANSPW)
+f_vial_kwoTELCwoTRANS_w <- spml(formula_vial_kwoTELCwoTRANSPw, data = full.ds,
+               index = c("country","year"),
+               listw = distmat.latam.inv.weighted.knn,
+               model="within", spatial.error="none",
+               effect = "twoways", method = "eigen",
+               lag=TRUE)
+
+summary(f_vial_kwoTELCwoTRANS_w)
+
+# data panel model using log transf. , kapital without telc and transp (N)
+formula_vial_kwoTELCwoTRANSPn <- log(GDPN) ~ log(TPN) + log(KwoTELCwoTRANSPN)
+f_vial_kwoTELCwoTRANS_n <- spml(formula_vial_kwoTELCwoTRANSPn, data = full.ds,
+               index = c("country","year"),
+               listw = distmat.latam.inv.weighted.knn,
+               model="within", spatial.error="none",
+               effect = "twoways", method = "eigen",
+               lag=TRUE)
+
+summary(f_vial_kwoTELCwoTRANS_n)
+
+```
